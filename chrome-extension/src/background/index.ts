@@ -6,10 +6,11 @@ import { createLogger } from './log';
 import { ExecutionState } from './agent/event/types';
 import { createChatModel } from './agent/helper';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import { connectToApiBridge } from './api-bridge';
 
 const logger = createLogger('background');
 
-const browserContext = new BrowserContext({});
+export const browserContext = new BrowserContext({});
 let currentExecutor: Executor | null = null;
 let currentPort: chrome.runtime.Port | null = null;
 
@@ -73,6 +74,9 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 
 logger.info('background loaded');
+
+// Connect to the API bridge when the extension loads
+connectToApiBridge();
 
 // Setup connection listener
 chrome.runtime.onConnect.addListener(port => {
@@ -164,7 +168,7 @@ chrome.runtime.onConnect.addListener(port => {
   }
 });
 
-async function setupExecutor(taskId: string, task: string, browserContext: BrowserContext) {
+export async function setupExecutor(taskId: string, task: string, browserContext: BrowserContext) {
   const providers = await llmProviderStore.getAllProviders();
   // if no providers, need to display the options page
   if (Object.keys(providers).length === 0) {
@@ -214,7 +218,7 @@ async function setupExecutor(taskId: string, task: string, browserContext: Brows
 }
 
 // Update subscribeToExecutorEvents to use port
-async function subscribeToExecutorEvents(executor: Executor) {
+export async function subscribeToExecutorEvents(executor: Executor) {
   // Clear previous event listeners to prevent multiple subscriptions
   executor.clearExecutionEvents();
 
