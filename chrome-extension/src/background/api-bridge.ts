@@ -1,13 +1,16 @@
 // API bridge for connecting nanobrowser to external systems
 import { createLogger } from './log';
+import { ExecutionState } from './agent/event/types';
+import type { Executor } from './agent/executor';
 
+const NANOBROWSER_VERSION = '0.1.4';
 const logger = createLogger('api-bridge');
 
 // WebSocket connection for external API communication
 let apiSocket: WebSocket | null = null;
 let apiReconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_DELAY = 5000; // 5 seconds
+const MAX_RECONNECT_ATTEMPTS = 20;
+const RECONNECT_DELAY = 3000; // 3 seconds
 
 // Function to connect to the API bridge
 export function connectToApiBridge() {
@@ -18,6 +21,17 @@ export function connectToApiBridge() {
     apiSocket.onopen = () => {
       logger.info('Connected to nanobrowser API bridge');
       apiReconnectAttempts = 0;
+
+      // Send hello message when connected
+      if (apiSocket) {
+        apiSocket.send(
+          JSON.stringify({
+            type: 'hello',
+            client: 'nanobrowser-extension',
+            version: NANOBROWSER_VERSION,
+          }),
+        );
+      }
     };
 
     apiSocket.onmessage = event => {
@@ -79,12 +93,15 @@ async function handleExternalTask(message: any) {
 
     // Create a new executor for the task
     // We need to import these from the index to avoid circular dependencies
-    const { setupExecutor, subscribeToExecutorEvents, browserContext } = await import('./index');
+    const { setupExecutor, browserContext } = await import('./index');
 
-    const currentExecutor = await setupExecutor(message.taskId || `ext-${Date.now()}`, message.task, browserContext);
+    // Generate task ID if not provided
+    const taskId = message.taskId || `ext-${Date.now()}`;
 
-    // Subscribe to executor events
-    subscribeToExecutorEvents(currentExecutor);
+    const currentExecutor = await setupExecutor(taskId, message.task, browserContext);
+
+    // Subscribe to executor events with our custom handler that streams to WebSocket
+    subscribeToExecutorEventsWithStreaming(currentExecutor, taskId);
 
     // Execute the task
     const result = await currentExecutor.execute();
@@ -99,6 +116,7 @@ async function handleExternalTask(message: any) {
           result: result,
         }),
       );
+      logger.info(`Sent task result for task ${message.taskId}`);
     }
   } catch (error) {
     logger.error('Error handling external task:', error);
@@ -114,4 +132,60 @@ async function handleExternalTask(message: any) {
       );
     }
   }
+}
+
+// Function to subscribe to executor events and stream them to the WebSocket
+function subscribeToExecutorEventsWithStreaming(executor: Executor, taskId: string) {
+  logger.info(`Setting up event streaming for task: ${taskId}`);
+
+  // Clear previous event listeners to prevent multiple subscriptions
+  executor.clearExecutionEvents();
+
+  // Subscribe to new events
+  executor.subscribeExecutionEvents(async event => {
+    logger.info(`Received executor event: ${event.actor}.${event.state} for task ${taskId}`);
+
+    try {
+      // Forward the event to the side panel if available
+      // We need to use the subscribeToExecutorEvents function from index.ts
+      // which already handles the side panel communication
+      const { subscribeToExecutorEvents } = await import('./index');
+      // We don't need to call it here as it's already being handled in the executor
+
+      // Prepare the message for the WebSocket server
+      const eventMessage = {
+        type: 'agent_event',
+        taskId: taskId,
+        event: {
+          actor: event.actor,
+          state: event.state,
+          timestamp: event.timestamp,
+          data: {
+            step: event.data.step,
+            maxSteps: event.data.maxSteps,
+            details: event.data.details,
+          },
+        },
+      };
+
+      // Send the message to the WebSocket server
+      if (apiSocket && apiSocket.readyState === WebSocket.OPEN) {
+        apiSocket.send(JSON.stringify(eventMessage));
+        logger.info(`Streamed ${event.actor} event: ${event.state}`);
+      } else {
+        logger.error('WebSocket not connected, cannot stream event');
+      }
+
+      // Handle task completion
+      if (
+        event.state === ExecutionState.TASK_OK ||
+        event.state === ExecutionState.TASK_FAIL ||
+        event.state === ExecutionState.TASK_CANCEL
+      ) {
+        await executor.cleanup();
+      }
+    } catch (error) {
+      logger.error('Failed to stream event:', error);
+    }
+  });
 }
