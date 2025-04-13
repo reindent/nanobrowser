@@ -9,11 +9,19 @@ const logger = createLogger('api-bridge');
 // WebSocket connection for external API communication
 let apiSocket: WebSocket | null = null;
 let apiReconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 20;
-const RECONNECT_DELAY = 3000; // 3 seconds
+
+// Attempt to connect/reconnect automatically
+const RECONNECT_DELAY = 1000;
+// TODO: disable somehow for clients which do not have a local WebSocket server
+setInterval(() => {
+  if (apiSocket && apiSocket.readyState === WebSocket.OPEN) return;
+  apiReconnectAttempts++;
+  connectToApiBridge();
+}, RECONNECT_DELAY);
 
 // Function to connect to the API bridge
 export function connectToApiBridge() {
+  logger.info('Connecting to nanobrowser API bridge...');
   try {
     // Connect to the local WebSocket server
     apiSocket = new WebSocket('ws://localhost:8787');
@@ -27,7 +35,7 @@ export function connectToApiBridge() {
         apiSocket.send(
           JSON.stringify({
             type: 'hello',
-            client: 'nanobrowser-extension',
+            name: 'nanobrowser-extension',
             version: NANOBROWSER_VERSION,
           }),
         );
@@ -37,11 +45,30 @@ export function connectToApiBridge() {
     apiSocket.onmessage = event => {
       try {
         const message = JSON.parse(event.data);
+        // Handle ping
+        if (message.type === 'ping') {
+          if (apiSocket && apiSocket.readyState === WebSocket.OPEN) {
+            apiSocket.send(JSON.stringify({ type: 'pong' }));
+          }
+          return;
+        }
+        if (message.type === 'pong') return;
+
         logger.info('Received message from API bridge:', message);
 
         // Handle external task requests
         if (message.type === 'external_task') {
           handleExternalTask(message);
+        }
+
+        // Handle provider configuration updates
+        if (message.type === 'llm_provider') {
+          handleProviderConfig(message);
+        }
+
+        // Handle agent model configuration updates
+        if (message.type === 'agent_model') {
+          handleAgentModelConfig(message);
         }
       } catch (error) {
         logger.error('Error handling API bridge message:', error);
@@ -50,22 +77,119 @@ export function connectToApiBridge() {
 
     apiSocket.onclose = () => {
       logger.info('Disconnected from nanobrowser API bridge');
-
-      // Attempt to reconnect with backoff
-      if (apiReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        setTimeout(() => {
-          apiReconnectAttempts++;
-          logger.info(`Attempting to reconnect to API bridge (${apiReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-          connectToApiBridge();
-        }, RECONNECT_DELAY * apiReconnectAttempts);
-      }
     };
 
     apiSocket.onerror = error => {
       logger.error('WebSocket error:', error);
     };
   } catch (error) {
-    logger.error('Failed to connect to API bridge:', error);
+    // fail silently to avoid polluting console
+    // logger.error('Failed to connect to API bridge:', error);
+  }
+}
+
+// Function to handle provider configuration updates
+async function handleProviderConfig(message: any) {
+  try {
+    if (!message.provider || !message.action) {
+      logger.error('Provider config missing required fields: provider or action');
+      return;
+    }
+
+    const { provider, action } = message;
+    logger.info(`Received provider ${action} for ${provider.id}`);
+
+    // Import the necessary storage module
+    const { llmProviderStore } = await import('../../../packages/storage/lib/settings/llmProviders');
+
+    // Handle the action
+    if (action === 'create' || action === 'update') {
+      await llmProviderStore.setProvider(provider.id, {
+        apiKey: provider.apiKey,
+        name: provider.name || provider.id,
+        baseUrl: provider.baseUrl,
+        modelNames: provider.modelNames || [],
+      });
+      logger.info(`Successfully ${action}d provider: ${provider.id}`);
+    } else if (action === 'delete') {
+      await llmProviderStore.removeProvider(provider.id);
+      logger.info(`Successfully deleted provider: ${provider.id}`);
+    }
+
+    // Send confirmation back to API bridge if connected
+    if (apiSocket && apiSocket.readyState === WebSocket.OPEN) {
+      apiSocket.send(
+        JSON.stringify({
+          type: 'llm_provider_result',
+          providerId: provider.id,
+          action: action,
+          success: true,
+        }),
+      );
+    }
+  } catch (error) {
+    logger.error('Error handling provider config update:', error);
+
+    // Send error back to API bridge if connected
+    if (apiSocket && apiSocket.readyState === WebSocket.OPEN) {
+      apiSocket.send(
+        JSON.stringify({
+          type: 'llm_provider_error',
+          providerId: message.provider?.id,
+          action: message.action,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        }),
+      );
+    }
+  }
+}
+
+// Function to handle agent model configuration updates
+async function handleAgentModelConfig(message: any) {
+  try {
+    if (!message.agent || !message.config) {
+      logger.error('Agent model config missing required fields: agent or config');
+      return;
+    }
+
+    const { agent, config } = message;
+    logger.info(`Received model config update for agent: ${agent}`);
+
+    // Import the necessary storage module
+    const { agentModelStore } = await import('../../../packages/storage/lib/settings/agentModels');
+
+    // Update the agent model configuration
+    await agentModelStore.setAgentModel(agent, {
+      provider: config.provider,
+      modelName: config.modelName,
+      parameters: config.parameters,
+    });
+
+    logger.info(`Successfully updated model config for agent: ${agent}`);
+
+    // Send confirmation back to API bridge if connected
+    if (apiSocket && apiSocket.readyState === WebSocket.OPEN) {
+      apiSocket.send(
+        JSON.stringify({
+          type: 'agent_model_result',
+          agent: agent,
+          success: true,
+        }),
+      );
+    }
+  } catch (error) {
+    logger.error('Error handling agent model config update:', error);
+
+    // Send error back to API bridge if connected
+    if (apiSocket && apiSocket.readyState === WebSocket.OPEN) {
+      apiSocket.send(
+        JSON.stringify({
+          type: 'agent_model_error',
+          agent: message.agent,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        }),
+      );
+    }
   }
 }
 
